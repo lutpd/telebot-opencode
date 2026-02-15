@@ -1,7 +1,12 @@
 import os
 import requests
+import uuid
+import json
 from flask import Flask, request
 from openai import OpenAI
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import PointStruct, Distance, VectorParams
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -11,11 +16,138 @@ API_KEY = os.environ.get("LLM_API_KEY")
 BASE_URL = os.environ.get("LLM_BASE_URL")    # e.g., https://api.groq.com/openai/v1
 MODEL_NAME = os.environ.get("LLM_MODEL_NAME") # e.g., llama3-8b-8192
 
+# Qdrant Configuration
+QDRANT_URL = os.environ.get("QDRANT_URL")      # e.g., https://your-cluster.qdrant.io
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
+COLLECTION_NAME = "telegram_chat_memory"
+
 # Initialize the OpenAI Client
 client = OpenAI(
     api_key=API_KEY,
     base_url=BASE_URL
 )
+
+# Initialize Qdrant Client
+qdrant_client = None
+if QDRANT_URL and QDRANT_API_KEY:
+    try:
+        qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+        # Create collection if it doesn't exist
+        collections = qdrant_client.get_collections().collections
+        if not any(c.name == COLLECTION_NAME for c in collections):
+            qdrant_client.create_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config=VectorParams(size=768, distance=Distance.COSINE)
+            )
+        print("✅ Qdrant client initialized successfully")
+    except Exception as e:
+        print(f"⚠️ Qdrant initialization error: {e}")
+        qdrant_client = None
+else:
+    print("⚠️ Qdrant not configured. Running without memory.")
+
+# In-memory fallback for chat sessions (if Qdrant fails)
+memory_fallback = {}
+
+def get_chat_history(chat_id, limit=10):
+    """Retrieve chat history from Qdrant or fallback memory."""
+    if qdrant_client:
+        try:
+            # Search for messages from this chat
+            results = qdrant_client.scroll(
+                collection_name=COLLECTION_NAME,
+                scroll_filter={
+                    "must": [{"key": "chat_id", "match": {"value": str(chat_id)}}]
+                },
+                limit=limit * 2,  # Get more to account for user+assistant pairs
+                with_payload=True,
+                with_vectors=False
+            )[0]
+            
+            # Sort by timestamp
+            messages = []
+            for point in results:
+                payload = point.payload
+                messages.append({
+                    "role": payload.get("role"),
+                    "content": payload.get("content"),
+                    "timestamp": payload.get("timestamp")
+                })
+            
+            messages.sort(key=lambda x: x.get("timestamp", ""))
+            return [{"role": m["role"], "content": m["content"]} for m in messages[-limit:]]
+        except Exception as e:
+            print(f"Qdrant error, using fallback: {e}")
+    
+    # Fallback to memory
+    return memory_fallback.get(str(chat_id), [])
+
+def store_message(chat_id, role, content):
+    """Store a message in Qdrant or fallback memory."""
+    timestamp = datetime.now().isoformat()
+    
+    if qdrant_client:
+        try:
+            # Create a simple vector (using timestamp-based placeholder since we may not have embeddings)
+            # In production, you might want to use actual text embeddings
+            vector = [0.0] * 768  # Placeholder vector
+            point_id = str(uuid.uuid4())
+            
+            qdrant_client.upsert(
+                collection_name=COLLECTION_NAME,
+                points=[
+                    PointStruct(
+                        id=point_id,
+                        vector=vector,
+                        payload={
+                            "chat_id": str(chat_id),
+                            "role": role,
+                            "content": content,
+                            "timestamp": timestamp
+                        }
+                    )
+                ]
+            )
+            return True
+        except Exception as e:
+            print(f"Qdrant store error: {e}")
+    
+    # Fallback to memory
+    chat_key = str(chat_id)
+    if chat_key not in memory_fallback:
+        memory_fallback[chat_key] = []
+    memory_fallback[chat_key].append({"role": role, "content": content})
+    # Keep only last 20 messages
+    memory_fallback[chat_key] = memory_fallback[chat_key][-20:]
+    return True
+
+def clear_chat_memory(chat_id):
+    """Clear chat memory for a specific chat."""
+    if qdrant_client:
+        try:
+            # Delete all points for this chat_id
+            qdrant_client.delete(
+                collection_name=COLLECTION_NAME,
+                points_selector={
+                    "filter": {
+                        "must": [{"key": "chat_id", "match": {"value": str(chat_id)}}]
+                    }
+                }
+            )
+        except Exception as e:
+            print(f"Qdrant clear error: {e}")
+    
+    # Clear fallback memory
+    if str(chat_id) in memory_fallback:
+        memory_fallback[str(chat_id)] = []
+    return True
+
+def format_bold_text(text):
+    """Ensure bold text formatting is properly applied for Telegram Markdown."""
+    # Telegram uses **text** for bold (MarkdownV2 style)
+    # The current setup already uses Markdown parse_mode which handles this
+    # This function can be used for additional formatting if needed
+    return text
 
 # 1. Homepage Route (To avoid "Not Found" error)
 @app.route("/", methods=["GET"])
@@ -35,30 +167,68 @@ def telegram_webhook():
     if "message" in data and "text" in data["message"]:
         chat_id = data["message"]["chat"]["id"]
         user_text = data["message"]["text"]
+        user_id = data["message"]["from"]["id"]
         
+        # Handle /start command
         if user_text.startswith("/start"):
-            send_message(chat_id, "Hello! I am your AI assistant. Ask me anything!")
-            return "ok", 200
+            welcome_msg = """🤖 **Welcome to Your AI Assistant!**
 
+I'm here to help you with anything you need. I can remember our conversations too!
+
+**Commands:**
+• **/start** - Show this welcome message
+• **/bbb** - Start a fresh chat (clear memory)
+
+Just send me a message and I'll respond!"""
+            send_message(chat_id, welcome_msg)
+            return "ok", 200
+        
+        # Handle /bbb command (new chat section)
+        if user_text.startswith("/bbb"):
+            clear_chat_memory(chat_id)
+            send_message(chat_id, "🆕 **New chat started!**\n\nMemory cleared. Let's begin fresh! ✨")
+            return "ok", 200
+        
+        # Regular message - get AI response with memory
         try:
-            # Get response from AI
-            ai_response = get_ai_response(user_text)
-            # Send response to Telegram
-            send_message(chat_id, ai_response)
+            # Get chat history
+            history = get_chat_history(chat_id, limit=10)
+            
+            # Store user message
+            store_message(chat_id, "user", user_text)
+            
+            # Get AI response
+            ai_response = get_ai_response(user_text, history)
+            
+            # Store assistant response
+            store_message(chat_id, "assistant", ai_response)
+            
+            # Format and send response
+            formatted_response = format_bold_text(ai_response)
+            send_message(chat_id, formatted_response)
+            
         except Exception as e:
             print(f"Error: {e}")
             send_message(chat_id, "⚠️ Sorry, I encountered an error. Please try again.")
 
     return "ok", 200
 
-def get_ai_response(prompt):
-    """Calls the OpenAI-compatible API."""
+def get_ai_response(prompt, history=None):
+    """Calls the OpenAI-compatible API with conversation history."""
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant. Use markdown formatting with **bold** for important words and titles. Be concise but informative."}
+    ]
+    
+    # Add conversation history
+    if history:
+        messages.extend(history)
+    
+    # Add current prompt
+    messages.append({"role": "user", "content": prompt})
+    
     response = client.chat.completions.create(
         model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant. Use markdown for formatting."},
-            {"role": "user", "content": prompt}
-        ]
+        messages=messages
     )
     return response.choices[0].message.content
 
