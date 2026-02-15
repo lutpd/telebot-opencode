@@ -5,7 +5,7 @@ import json
 from flask import Flask, request
 from openai import OpenAI
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import PointStruct, Distance, VectorParams
+from qdrant_client.http.models import PointStruct, Distance, VectorParams, Filter, FieldCondition, MatchValue
 from datetime import datetime
 
 app = Flask(__name__)
@@ -39,6 +39,12 @@ if QDRANT_URL and QDRANT_API_KEY:
                 collection_name=COLLECTION_NAME,
                 vectors_config=VectorParams(size=768, distance=Distance.COSINE)
             )
+            # Create payload index for chat_id filtering
+            qdrant_client.create_payload_index(
+                collection_name=COLLECTION_NAME,
+                field_name="chat_id",
+                field_schema="keyword"
+            )
         print("✅ Qdrant client initialized successfully")
     except Exception as e:
         print(f"⚠️ Qdrant initialization error: {e}")
@@ -54,11 +60,17 @@ def get_chat_history(chat_id, limit=10):
     if qdrant_client:
         try:
             # Search for messages from this chat
+            scroll_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="chat_id",
+                        match=MatchValue(value=str(chat_id))
+                    )
+                ]
+            )
             results = qdrant_client.scroll(
                 collection_name=COLLECTION_NAME,
-                scroll_filter={
-                    "must": [{"key": "chat_id", "match": {"value": str(chat_id)}}]
-                },
+                scroll_filter=scroll_filter,
                 limit=limit * 2,  # Get more to account for user+assistant pairs
                 with_payload=True,
                 with_vectors=False
@@ -128,11 +140,14 @@ def clear_chat_memory(chat_id):
             # Delete all points for this chat_id
             qdrant_client.delete(
                 collection_name=COLLECTION_NAME,
-                points_selector={
-                    "filter": {
-                        "must": [{"key": "chat_id", "match": {"value": str(chat_id)}}]
-                    }
-                }
+                points_selector=Filter(
+                    must=[
+                        FieldCondition(
+                            key="chat_id",
+                            match=MatchValue(value=str(chat_id))
+                        )
+                    ]
+                )
             )
         except Exception as e:
             print(f"Qdrant clear error: {e}")
