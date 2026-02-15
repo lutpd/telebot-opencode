@@ -39,12 +39,22 @@ if QDRANT_URL and QDRANT_API_KEY:
                 collection_name=COLLECTION_NAME,
                 vectors_config=VectorParams(size=768, distance=Distance.COSINE)
             )
-            # Create payload index for chat_id filtering
+        
+        # Always ensure the index exists (even for existing collections)
+        try:
             qdrant_client.create_payload_index(
                 collection_name=COLLECTION_NAME,
                 field_name="chat_id",
                 field_schema="keyword"
             )
+            print("✅ Qdrant index created/verified")
+        except Exception as e:
+            # Index might already exist, which is fine
+            if "already exists" in str(e).lower():
+                print("✅ Qdrant index already exists")
+            else:
+                print(f"⚠️ Qdrant index error: {e}")
+        
         print("✅ Qdrant client initialized successfully")
     except Exception as e:
         print(f"⚠️ Qdrant initialization error: {e}")
@@ -87,6 +97,7 @@ def get_chat_history(chat_id, limit=10):
                 })
             
             messages.sort(key=lambda x: x.get("timestamp", ""))
+            print(f"📥 Retrieved {len(messages)} messages for chat {chat_id}")
             return [{"role": m["role"], "content": m["content"]} for m in messages[-limit:]]
         except Exception as e:
             print(f"Qdrant error, using fallback: {e}")
@@ -120,6 +131,7 @@ def store_message(chat_id, role, content):
                     )
                 ]
             )
+            print(f"✅ Stored message for chat {chat_id}: {role}")
             return True
         except Exception as e:
             print(f"Qdrant store error: {e}")
@@ -161,7 +173,7 @@ def format_bold_text(text):
     """Ensure bold text formatting is properly applied for Telegram Markdown."""
     return text
 
-def get_status_message():
+def get_status_message(chat_id=None):
     """Check and return Qdrant status."""
     if not QDRANT_URL or not QDRANT_API_KEY:
         return "⚠️ **Qdrant not configured**\n\nRunning in fallback mode (memory only).\n\nSet QDRANT_URL and QDRANT_API_KEY env vars."
@@ -174,15 +186,32 @@ def get_status_message():
         collections = qdrant_client.get_collections().collections
         collection_exists = any(c.name == COLLECTION_NAME for c in collections)
         
-        # Count messages in collection
-        count = 0
+        # Count total messages in collection
+        total_count = 0
         if collection_exists:
             count_info = qdrant_client.count(collection_name=COLLECTION_NAME)
-            count = count_info.count
+            total_count = count_info.count
         
         status = "✅ **Qdrant is working!**\n\n"
         status += f"📁 Collection: `{COLLECTION_NAME}`\n"
-        status += f"📝 Total messages stored: `{count}`\n"
+        status += f"📝 Total messages stored: `{total_count}`\n"
+        
+        # Count messages for this specific chat
+        if chat_id:
+            chat_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="chat_id",
+                        match=MatchValue(value=str(chat_id))
+                    )
+                ]
+            )
+            chat_count_info = qdrant_client.count(
+                collection_name=COLLECTION_NAME,
+                count_filter=chat_filter
+            )
+            status += f"💬 Messages in this chat: `{chat_count_info.count}`\n"
+        
         status += f"🔗 URL: `{QDRANT_URL[:30]}...`\n\n"
         status += "Memory is persistent across restarts!"
         return status
@@ -232,7 +261,7 @@ Just send me a message and I'll respond!"""
         
         # Handle /status command (check Qdrant status)
         if user_text.startswith("/status"):
-            status_msg = get_status_message()
+            status_msg = get_status_message(chat_id)
             send_message(chat_id, status_msg)
             return "ok", 200
         
