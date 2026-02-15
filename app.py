@@ -159,10 +159,35 @@ def clear_chat_memory(chat_id):
 
 def format_bold_text(text):
     """Ensure bold text formatting is properly applied for Telegram Markdown."""
-    # Telegram uses **text** for bold (MarkdownV2 style)
-    # The current setup already uses Markdown parse_mode which handles this
-    # This function can be used for additional formatting if needed
     return text
+
+def get_status_message():
+    """Check and return Qdrant status."""
+    if not QDRANT_URL or not QDRANT_API_KEY:
+        return "⚠️ **Qdrant not configured**\n\nRunning in fallback mode (memory only).\n\nSet QDRANT_URL and QDRANT_API_KEY env vars."
+    
+    if qdrant_client is None:
+        return "❌ **Qdrant connection failed**\n\nCheck your QDRANT_URL and QDRANT_API_KEY.\nUsing fallback memory."
+    
+    try:
+        # Test connection
+        collections = qdrant_client.get_collections().collections
+        collection_exists = any(c.name == COLLECTION_NAME for c in collections)
+        
+        # Count messages in collection
+        count = 0
+        if collection_exists:
+            count_info = qdrant_client.count(collection_name=COLLECTION_NAME)
+            count = count_info.count
+        
+        status = "✅ **Qdrant is working!**\n\n"
+        status += f"📁 Collection: `{COLLECTION_NAME}`\n"
+        status += f"📝 Total messages stored: `{count}`\n"
+        status += f"🔗 URL: `{QDRANT_URL[:30]}...`\n\n"
+        status += "Memory is persistent across restarts!"
+        return status
+    except Exception as e:
+        return f"❌ **Qdrant error:** `{str(e)[:100]}`\n\nUsing fallback memory."
 
 # 1. Homepage Route (To avoid "Not Found" error)
 @app.route("/", methods=["GET"])
@@ -193,6 +218,7 @@ I'm here to help you with anything you need. I can remember our conversations to
 **Commands:**
 • **/start** - Show this welcome message
 • **/bbb** - Start a fresh chat (clear memory)
+• **/status** - Check Qdrant memory status
 
 Just send me a message and I'll respond!"""
             send_message(chat_id, welcome_msg)
@@ -202,6 +228,12 @@ Just send me a message and I'll respond!"""
         if user_text.startswith("/bbb"):
             clear_chat_memory(chat_id)
             send_message(chat_id, "🆕 **New chat started!**\n\nMemory cleared. Let's begin fresh! ✨")
+            return "ok", 200
+        
+        # Handle /status command (check Qdrant status)
+        if user_text.startswith("/status"):
+            status_msg = get_status_message()
+            send_message(chat_id, status_msg)
             return "ok", 200
         
         # Regular message - get AI response with memory
