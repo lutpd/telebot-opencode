@@ -2,3 +2,4 @@ Flask
 requests
 openai
 gunicorn
+qdrant-client
